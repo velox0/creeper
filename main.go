@@ -1,15 +1,15 @@
 package main
 
 import (
+	"encoding/xml"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
-
-	"encoding/xml"
 
 	"golang.org/x/net/html"
 	"golang.org/x/term"
@@ -173,32 +173,46 @@ func printSummaryTable(state *CrawlerState, startPath string) {
 	}
 }
 
-func writeXML(state *CrawlerState) error {
-	maxOutgoing := 1
-	maxIncoming := 1
+// pathDepth returns the number of path segments (e.g. "/" -> 0, "/a/b" -> 2)
+func pathDepth(path string) int {
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "" {
+		return 0
+	}
+	return len(strings.Split(trimmed, "/"))
+}
+
+func writeXML(state *CrawlerState, outFile string) error {
+	maxIncoming := 0
 	for norm := range state.paths {
-		if state.outgoing[norm] > maxOutgoing {
-			maxOutgoing = state.outgoing[norm]
-		}
 		if state.incoming[norm] > maxIncoming {
 			maxIncoming = state.incoming[norm]
 		}
 	}
-	const outlinkWeight, inlinkWeight = 0.75, 0.25
 
 	urls := make([]XMLUrl, 0, len(state.paths))
 	for norm := range state.paths {
-		out := state.outgoing[norm]
 		in := state.incoming[norm]
-		outNorm := float64(out) / float64(maxOutgoing)
-		inNorm := float64(in) / float64(maxIncoming)
-		priority := outlinkWeight*outNorm + inlinkWeight*inNorm
+
+		// Log-scaled incoming link score: pages with more backlinks rank higher
+		var inScore float64
+		if maxIncoming > 0 {
+			inScore = math.Log1p(float64(in)) / math.Log1p(float64(maxIncoming))
+		}
+
+		// Depth score: shallower pages are more important (halves per level)
+		depth := pathDepth(state.paths[norm])
+		depthScore := 1.0 / math.Pow(2.0, float64(depth))
+
+		// 70% incoming links, 30% depth; clamp to sitemap spec [0.1, 1.0]
+		priority := 0.7*inScore + 0.3*depthScore
+		priority = math.Max(0.1, math.Min(1.0, priority))
+
 		urls = append(urls, XMLUrl{
 			Loc:      norm,
 			Priority: fmt.Sprintf("%.2f", priority),
 		})
 	}
-	// Sort urls by priority descending
 	sort.Slice(urls, func(i, j int) bool {
 		return urls[i].Priority > urls[j].Priority
 	})
@@ -206,7 +220,7 @@ func writeXML(state *CrawlerState) error {
 		Xmlns: "http://www.sitemaps.org/schemas/sitemap/0.9",
 		Urls:  urls,
 	}
-	f, err := os.Create("sitemap.xml")
+	f, err := os.Create(outFile)
 	if err != nil {
 		return err
 	}
@@ -250,21 +264,32 @@ func main() {
 	maxPages := flag.Int("n", 100, "Maximum number of pages to visit")
 	maxDepth := flag.Int("i", 0, "Maximum recursion depth (0 = unlimited)")
 	showSummary := flag.Bool("s", true, "Show summary of incoming links at the end")
-	xmlOut := flag.Bool("x", false, "Generate XML output (output.xml)")
+	xmlOut := flag.Bool("x", false, "Generate XML sitemap")
+	outFile := flag.String("o", "sitemap.xml", "Output file for XML sitemap (used with -x)")
 	useLocalhost := flag.Bool("l", false, "Crawl using localhost for the given domain (for local server testing)")
-	port := flag.Int("p", 80, "Port to use with -l (default 80)")
+	port := flag.Int("p", 80, "Port to use when crawling localhost")
 	flag.Parse()
 
+	var startURL string
 	if flag.NArg() < 1 {
-		fmt.Println("Usage: go run main.go [flags] <url>")
-		flag.PrintDefaults()
-		return
+		// No URL given — default to localhost on the specified port
+		startURL = fmt.Sprintf("http://localhost:%d", *port)
+		*useLocalhost = false // crawling localhost directly, no rewriting needed
+	} else {
+		startURL = flag.Arg(0)
+		// If a non-default port is given without -l, assume localhost mode
+		if *port != 80 && !*useLocalhost {
+			*useLocalhost = true
+		}
 	}
-	startURL := flag.Arg(0)
 
-	// Default to https if no scheme is specified
+	// Default to https if no scheme is specified (skip for localhost)
 	if !strings.HasPrefix(startURL, "http://") && !strings.HasPrefix(startURL, "https://") {
-		startURL = "https://" + startURL
+		if strings.HasPrefix(startURL, "localhost") {
+			startURL = "http://" + startURL
+		} else {
+			startURL = "https://" + startURL
+		}
 	}
 
 	base, err := url.Parse(startURL)
@@ -275,7 +300,6 @@ func main() {
 	origHost := base.Host
 	firstURL := base
 	if *useLocalhost {
-		// Rewrite for localhost and port, and always use http
 		localURL := *base
 		localURL.Scheme = "http"
 		localURL.Host = "localhost"
@@ -307,11 +331,11 @@ func main() {
 		printSummaryTable(state, startPath)
 	}
 	if *xmlOut {
-		err := writeXML(state)
+		err := writeXML(state, *outFile)
 		if err != nil {
 			fmt.Println("Error writing XML:", err)
 		} else {
-			fmt.Println("XML written to sitemap.xml")
+			fmt.Printf("XML written to %s\n", *outFile)
 		}
 	}
 }
