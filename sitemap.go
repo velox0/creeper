@@ -29,41 +29,21 @@ func pathDepth(path string) int {
 	return len(strings.Split(trimmed, "/"))
 }
 
-// priority computes the sitemap priority for a single page.
-//
-// Without change history the formula is:
-//
-//	0.70 × inScore + 0.30 × depthScore
-//
-// When a PageHistory is available the change score displaces some weight:
-//
-//	0.55 × inScore + 0.20 × depthScore + 0.25 × changeScore
-//
-// The result is clamped to [0.1, 1.0] per the sitemap spec.
-func priority(inScore, depthScore float64, ph *PageHistory) float64 {
-	var p float64
-	if ph != nil {
-		p = 0.55*inScore + 0.20*depthScore + 0.25*ph.score()
-	} else {
-		p = 0.70*inScore + 0.30*depthScore
-	}
-	return math.Max(0.1, math.Min(1.0, p))
-}
-
-// writeXML generates an XML sitemap from the crawl state and writes it to
-// outFile. When history is non-nil, page-change scores influence priorities.
-func writeXML(state *CrawlerState, outFile string, history *ChangeHistory) (err error) {
+// computePriorities calculates the sitemap priority for each page using the original
+// heuristic (depth + incoming links) but perfectly normalized so the top page is 1.0.
+func computePriorities(state *CrawlerState, history *ChangeHistory) map[string]float64 {
 	maxIncoming := 0
-	for norm := range state.paths {
-		if v := state.incoming[norm]; v > maxIncoming {
-			maxIncoming = v
+	for _, in := range state.incoming {
+		if in > maxIncoming {
+			maxIncoming = in
 		}
 	}
 
-	entries := make([]xmlURL, 0, len(state.paths))
+	rawScores := make(map[string]float64)
+	maxRaw := 0.0
+
 	for norm := range state.paths {
 		in := state.incoming[norm]
-
 		var inScore float64
 		if maxIncoming > 0 {
 			inScore = math.Log1p(float64(in)) / math.Log1p(float64(maxIncoming))
@@ -74,12 +54,44 @@ func writeXML(state *CrawlerState, outFile string, history *ChangeHistory) (err 
 
 		var ph *PageHistory
 		if history != nil {
-			ph = history.Pages[norm] // nil when URL has no prior history
+			ph = history.Pages[norm]
 		}
 
+		var p float64
+		if ph != nil {
+			p = 0.55*inScore + 0.20*depthScore + 0.25*ph.score()
+		} else {
+			p = 0.70*inScore + 0.30*depthScore
+		}
+
+		rawScores[norm] = p
+		if p > maxRaw {
+			maxRaw = p
+		}
+	}
+
+	// Normalize relative to the highest scoring page to ensure max is 1.0
+	finalScores := make(map[string]float64)
+	for norm, r := range rawScores {
+		var p float64
+		if maxRaw > 0 {
+			p = r / maxRaw
+		} else {
+			p = 1.0
+		}
+		finalScores[norm] = math.Max(0.1, math.Min(1.0, p))
+	}
+	return finalScores
+}
+
+// writeXML generates an XML sitemap from the crawl state and writes it to
+// outFile. When history is non-nil, page-change scores influence priorities.
+func writeXML(state *CrawlerState, outFile string, history *ChangeHistory, pr map[string]float64) (err error) {
+	entries := make([]xmlURL, 0, len(state.paths))
+	for norm := range state.paths {
 		entries = append(entries, xmlURL{
 			Loc:      norm,
-			Priority: fmt.Sprintf("%.2f", priority(inScore, depthScore, ph)),
+			Priority: fmt.Sprintf("%.2f", pr[norm]),
 		})
 	}
 

@@ -12,14 +12,14 @@ func main() {
 	flag.IntVar(maxPages, "n", 100, "")
 	maxDepth := flag.Int("depth", 0, "Maximum recursion depth (0 = unlimited, shorthand -d)")
 	flag.IntVar(maxDepth, "d", 0, "")
-	showSummary := flag.Bool("summary", true, "Show summary of incoming links at the end (shorthand -s)")
-	flag.BoolVar(showSummary, "s", true, "")
+	shh := flag.Bool("shh", false, "Turn off summary of incoming links (shorthand -s)")
+	flag.BoolVar(shh, "s", false, "")
 	xmlOut := flag.Bool("xml", false, "Generate XML sitemap (shorthand -x)")
 	flag.BoolVar(xmlOut, "x", false, "")
 	outFile := flag.String("output", "sitemap.xml", "Output file for XML sitemap (shorthand -o)")
 	flag.StringVar(outFile, "o", "sitemap.xml", "")
-	useLocalhost := flag.Bool("local", false, "Crawl using localhost for the given domain (shorthand -l)")
-	flag.BoolVar(useLocalhost, "l", false, "")
+	verbose := flag.Bool("verbose", false, "Show weights of pages (shorthand -v)")
+	flag.BoolVar(verbose, "v", false, "")
 	port := flag.Int("port", 80, "Port to use when crawling localhost (shorthand -p)")
 	flag.IntVar(port, "p", 80, "")
 	trackChanges := flag.Bool("track", false, "Track page content changes across runs; bumps sitemap priority for frequently/recently updated pages (shorthand -t)")
@@ -28,13 +28,13 @@ func main() {
 
 	// Resolve start URL.
 	var startURL string
+	useLocalhost := false
 	if flag.NArg() < 1 {
 		startURL = fmt.Sprintf("http://localhost:%d", *port)
-		*useLocalhost = false
 	} else {
 		startURL = flag.Arg(0)
-		if *port != 80 && !*useLocalhost {
-			*useLocalhost = true
+		if *port != 80 {
+			useLocalhost = true
 		}
 	}
 	if !strings.HasPrefix(startURL, "http://") && !strings.HasPrefix(startURL, "https://") {
@@ -52,7 +52,7 @@ func main() {
 	}
 
 	cfg := fetchConfig{
-		useLocalhost: *useLocalhost,
+		useLocalhost: useLocalhost,
 		port:         *port,
 		origHost:     base.Host,
 	}
@@ -105,12 +105,14 @@ func main() {
 		}
 	}
 
-	if *showSummary {
+	pr := computePriorities(state, history)
+
+	if !*shh {
 		fmt.Println("\nSummary of visited pages and incoming link counts:")
-		printSummaryTable(state, startPath)
+		printSummaryTable(state, startPath, pr, *verbose)
 	}
 	if *xmlOut {
-		if err := writeXML(state, *outFile, history); err != nil {
+		if err := writeXML(state, *outFile, history, pr); err != nil {
 			fmt.Println("Error writing XML:", err)
 		} else {
 			fmt.Printf("XML written to %s\n", *outFile)
