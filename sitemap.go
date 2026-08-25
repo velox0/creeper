@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/xml"
 	"fmt"
+	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -14,117 +16,102 @@ type xmlURLSet struct {
 	Xmlns   string   `xml:"xmlns,attr"`
 	URLs    []xmlURL `xml:"url"`
 }
-
 type xmlURL struct {
 	Loc      string `xml:"loc"`
+	LastMod  string `xml:"lastmod,omitempty"`
 	Priority string `xml:"priority"`
 }
 
-// pathDepth returns the number of path segments ("/" → 0, "/a/b" → 2).
 func pathDepth(path string) int {
-	trimmed := strings.Trim(path, "/")
-	if trimmed == "" {
+	s := strings.Trim(path, "/")
+	if s == "" {
 		return 0
 	}
-	return len(strings.Split(trimmed, "/"))
+	return len(strings.Split(s, "/"))
 }
-
-// computePriorities calculates the sitemap priority for each page using the original
-// heuristic (depth + incoming links) but perfectly normalized so the top page is 1.0.
 func computePriorities(state *CrawlerState, history *ChangeHistory) map[string]float64 {
 	maxIncoming := 0
-	for _, in := range state.incoming {
-		if in > maxIncoming {
-			maxIncoming = in
+	for _, p := range state.Pages {
+		if p.Incoming > maxIncoming {
+			maxIncoming = p.Incoming
 		}
 	}
-
-	rawScores := make(map[string]float64)
-	maxRaw := 0.0
-
-	for norm := range state.paths {
-		in := state.incoming[norm]
-		var inScore float64
+	raw, result, maxRaw := map[string]float64{}, map[string]float64{}, 0.0
+	for norm, page := range state.Pages {
+		inScore := 0.0
 		if maxIncoming > 0 {
-			inScore = math.Log1p(float64(in)) / math.Log1p(float64(maxIncoming))
+			inScore = math.Log1p(float64(page.Incoming)) / math.Log1p(float64(maxIncoming))
 		}
-
-		depth := pathDepth(state.paths[norm])
-		depthScore := 1.0 / math.Pow(2.0, float64(depth))
-
-		var ph *PageHistory
-		if history != nil {
-			ph = history.Pages[norm]
+		depthScore := 1 / math.Pow(2, float64(pathDepth(page.Path)))
+		value := .7*inScore + .3*depthScore
+		if history != nil && history.Pages[norm] != nil {
+			value = .55*inScore + .2*depthScore + .25*history.Pages[norm].score()
 		}
-
-		var p float64
-		if ph != nil {
-			p = 0.55*inScore + 0.20*depthScore + 0.25*ph.score()
-		} else {
-			p = 0.70*inScore + 0.30*depthScore
-		}
-
-		rawScores[norm] = p
-		if p > maxRaw {
-			maxRaw = p
+		raw[norm] = value
+		if value > maxRaw {
+			maxRaw = value
 		}
 	}
-
-	// Normalize relative to the highest scoring page to ensure max is 1.0
-	finalScores := make(map[string]float64)
-	for norm, r := range rawScores {
-		var p float64
+	for norm, value := range raw {
 		if maxRaw > 0 {
-			p = r / maxRaw
+			value /= maxRaw
 		} else {
-			p = 1.0
+			value = 1
 		}
-		finalScores[norm] = math.Max(0.1, math.Min(1.0, p))
+		result[norm] = math.Max(.1, math.Min(1, value))
 	}
-	return finalScores
+	return result
 }
-
-// writeXML generates an XML sitemap from the crawl state and writes it to
-// outFile. When history is non-nil, page-change scores influence priorities.
-func writeXML(state *CrawlerState, outFile string, history *ChangeHistory, pr map[string]float64) (err error) {
-	entries := make([]xmlURL, 0, len(state.paths))
-	for norm := range state.paths {
-		entries = append(entries, xmlURL{
-			Loc:      norm,
-			Priority: fmt.Sprintf("%.2f", pr[norm]),
-		})
+func writeXML(state *CrawlerState, filename string, priorities map[string]float64, stdout io.Writer) error {
+	entries := make([]xmlURL, 0, len(state.Pages))
+	for norm, page := range state.Pages {
+		entries = append(entries, xmlURL{Loc: norm, LastMod: page.LastMod, Priority: fmt.Sprintf("%.2f", priorities[norm])})
 	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Priority > entries[j].Priority
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Loc < entries[j].Loc })
+	if len(entries) > 50000 {
+		return fmt.Errorf("%d URLs exceeds the sitemap protocol limit of 50000", len(entries))
+	}
+	return atomicOutput(filename, stdout, func(w io.Writer) error {
+		if _, err := io.WriteString(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"); err != nil {
+			return err
+		}
+		enc := xml.NewEncoder(w)
+		enc.Indent("", "  ")
+		return enc.Encode(xmlURLSet{Xmlns: "http://www.sitemaps.org/schemas/sitemap/0.9", URLs: entries})
 	})
-
-	urlset := xmlURLSet{
-		Xmlns: "http://www.sitemaps.org/schemas/sitemap/0.9",
-		URLs:  entries,
+}
+func atomicOutput(filename string, stdout io.Writer, write func(io.Writer) error) error {
+	if filename == "-" {
+		return write(stdout)
 	}
-
-	f, err := os.Create(outFile)
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".creeper-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	ok := false
 	defer func() {
-		if cerr := f.Close(); err == nil {
-			err = cerr
+		f.Close()
+		if !ok {
+			os.Remove(tmp)
 		}
 	}()
-
-	if _, err = f.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"); err != nil {
+	if err = write(f); err != nil {
 		return err
 	}
-	if _, err = f.WriteString("<!-- Generated by github.com/velox0/creeper -->\n"); err != nil {
+	if err = f.Sync(); err != nil {
 		return err
 	}
-
-	enc := xml.NewEncoder(f)
-	enc.Indent("", "  ")
-	if err = enc.Encode(urlset); err != nil {
+	if err = f.Close(); err != nil {
 		return err
 	}
+	if err = os.Rename(tmp, filename); err != nil {
+		return err
+	}
+	ok = true
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -44,28 +45,31 @@ func historyFilename(host string) string {
 
 // loadHistory reads the history file for the given path, returning an empty
 // ChangeHistory when the file does not exist or cannot be parsed.
-func loadHistory(filename string) *ChangeHistory {
+func loadHistory(filename string) (*ChangeHistory, error) {
 	h := &ChangeHistory{Pages: make(map[string]*PageHistory)}
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return h
+		if os.IsNotExist(err) {
+			return h, nil
+		}
+		return nil, err
 	}
-	if err := json.Unmarshal(data, h); err != nil || h.Pages == nil {
+	if err := json.Unmarshal(data, h); err != nil {
+		return nil, err
+	}
+	if h.Pages == nil {
 		h.Pages = make(map[string]*PageHistory)
 	}
-	return h
+	return h, nil
 }
 
 // saveHistory writes h to filename, creating parent directories as needed.
 func saveHistory(h *ChangeHistory, filename string) error {
-	data, err := json.MarshalIndent(h, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(filename, data, 0644)
+	return atomicOutput(filename, io.Discard, func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(h)
+	})
 }
 
 // record appends a new content observation for normURL. Returns true if the
@@ -84,6 +88,10 @@ func (h *ChangeHistory) record(normURL string, body []byte) bool {
 		Timestamp: time.Now().UTC(),
 		Hash:      digest,
 	})
+	const maxRecordsPerPage = 1000
+	if len(ph.Records) > maxRecordsPerPage {
+		ph.Records = ph.Records[len(ph.Records)-maxRecordsPerPage:]
+	}
 	return changed
 }
 

@@ -1,85 +1,50 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"sort"
-	"strings"
-
-	"golang.org/x/term"
 )
 
-// printSummaryTable writes a two-column table (incoming-link count | path) to
-// stdout, sized to the current terminal width.
-func printSummaryTable(state *CrawlerState, startPath string, pr map[string]float64, verbose bool) {
-	width, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || width < 30 {
-		width = 80
-	}
-	const countCol = 6
-	const prCol = 8
-	var pathCol int
-	if verbose {
-		pathCol = width - countCol - prCol - 6
-	} else {
-		pathCol = width - countCol - 3
-	}
+type discoveryReport struct {
+	Pages  []*Page      `json:"pages"`
+	Errors []CrawlError `json:"errors,omitempty"`
+}
 
-	// Deduplicate paths and pin startPath to the top.
-	seen := make(map[string]struct{}, len(state.paths))
-	for _, p := range state.paths {
-		seen[p] = struct{}{}
+func writeDiscovery(state *CrawlerState, filename string) error {
+	pages := make([]*Page, 0, len(state.Pages))
+	for _, p := range state.Pages {
+		clone := *p
+		clone.Body = nil
+		pages = append(pages, &clone)
 	}
-	sorted := make([]string, 0, len(seen))
-	for p := range seen {
-		sorted = append(sorted, p)
+	sort.Slice(pages, func(i, j int) bool { return pages[i].URL < pages[j].URL })
+	return atomicOutput(filename, io.Discard, func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(discoveryReport{Pages: pages, Errors: state.Errors})
+	})
+}
+func printSummaryTable(w io.Writer, state *CrawlerState, start string, priorities map[string]float64, verbose bool) {
+	pages := make([]*Page, 0, len(state.Pages))
+	for _, p := range state.Pages {
+		pages = append(pages, p)
 	}
-	// Move startPath to index 0, then sort the rest.
-	for i, p := range sorted {
-		if p == startPath {
-			sorted[0], sorted[i] = sorted[i], sorted[0]
-			break
+	sort.Slice(pages, func(i, j int) bool {
+		if pages[i].URL == start {
+			return true
 		}
-	}
-	sort.Strings(sorted[1:])
-
-	if verbose {
-		fmt.Printf("%-*s | %-*s | %s\n", countCol, "Count", prCol, "Weight", "Path")
-	} else {
-		fmt.Printf("%-*s | %s\n", countCol, "Count", "Path")
-	}
-	fmt.Println(strings.Repeat("-", width))
-
-	for _, p := range sorted {
-		var incoming int
-		var weight float64
-		for norm, path := range state.paths {
-			if path == p {
-				incoming = state.incoming[norm]
-				weight = pr[norm]
-				break
-			}
+		if pages[j].URL == start {
+			return false
 		}
-		runes := []rune(p)
-		for i := 0; i < len(runes); i += pathCol {
-			end := i + pathCol
-			if end > len(runes) {
-				end = len(runes)
-			}
-			chunk := string(runes[i:end])
-			if i == 0 {
-				if verbose {
-					fmt.Printf("%-*d | %-*.4f | %s\n", countCol, incoming, prCol, weight, chunk)
-				} else {
-					fmt.Printf("%-*d | %s\n", countCol, incoming, chunk)
-				}
-			} else {
-				if verbose {
-					fmt.Printf("%-*s | %-*s | %s\n", countCol, "", prCol, "", chunk)
-				} else {
-					fmt.Printf("%-*s | %s\n", countCol, "", chunk)
-				}
-			}
+		return pages[i].URL < pages[j].URL
+	})
+	for _, p := range pages {
+		if verbose {
+			fmt.Fprintf(w, "%4d  %.2f  %s\n", p.Incoming, priorities[p.URL], p.URL)
+		} else {
+			fmt.Fprintf(w, "%4d  %s\n", p.Incoming, p.URL)
 		}
 	}
 }
